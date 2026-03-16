@@ -1,0 +1,23 @@
+[package]
+name = "rmt-spca-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmt-spca = { path = "../rmt-spca" }
+
+# anndata-hdf5 0.2.x requires anndata 0.3.x (not 0.2.x despite the name)
+anndata      = "0.3"
+anndata-hdf5 = "0.2"
+
+faer  = "0.19"
+# anndata 0.3 pins ndarray 0.15; must match to avoid duplicate types
+ndarray         = "0.15"
+nalgebra-sparse = "0.9"   # must match anndata's own nalgebra-sparse version
+rayon           = "1.8"
+anyhow          = "1.0"
+
+# polars (transitive via anndata) calls raw_table_mut() which requires the
+# "raw" feature on hashbrown 0.14.  Cargo unifies features, so declaring it
+# here enables the feature for the whole resolved 0.14 graph.
+hashbrown = { version = "0.14", features = ["raw"] }
