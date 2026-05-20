@@ -21,3 +21,11 @@ anyhow          = "1.0"
 # "raw" feature on hashbrown 0.14.  Cargo unifies features, so declaring it
 # here enables the feature for the whole resolved 0.14 graph.
 hashbrown = { version = "0.14", features = ["raw"] }
+
+# UMAP via Python (umap-learn / scanpy) + plotting
+# pyo3 embeds the active Python interpreter; numpy gives zero-copy array passing.
+# Requires umap-learn to be installed in the active Python env:
+#   pip install umap-learn
+pyo3   = { version = "0.22", features = ["auto-initialize"] }
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder"] }
+clap     = { version = "4", features = ["derive"] }

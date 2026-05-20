@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use faer::Mat;
 use ndarray::{Array2, ArrayD, Ix2};
 
-use anndata::{ArrayElemOp, Backend};
+use anndata::{ArrayElemOp, AnnDataOp, Backend};
 use anndata::data::{ArrayData, DynArray, DynCsrMatrix, DynCscMatrix};
 use anndata_hdf5::H5;
 use nalgebra_sparse::CooMatrix;
@@ -15,6 +15,15 @@ impl ScDataReader {
     ///
     /// Handles dense (all numeric dtypes) and sparse CSR / CSC / non-canonical
     /// CSR storage formats, casting everything to f64.
+    /// Read `var_names` (gene names) from an `.h5ad` file.
+    /// Returns one string per column of X, in the same order.
+    pub fn load_var_names(path: &str) -> Result<Vec<String>> {
+        let file = H5::open(path).with_context(|| format!("cannot open HDF5 file: {path}"))?;
+        let adata = anndata::AnnData::<H5>::open(file)
+            .context("file is not a valid AnnData (.h5ad)")?;
+        Ok(adata.var_names().into_vec())
+    }
+
     pub fn load_h5ad_as_faer(path: &str) -> Result<Mat<f64>> {
         let file =
             H5::open(path).with_context(|| format!("cannot open HDF5 file: {path}"))?;
