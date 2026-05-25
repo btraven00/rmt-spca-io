@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use faer;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::Instant;
 
 use rmt_spca_io::{load_and_prepare, project_cells, run_umap_and_plot, Preprocessor};
 use rmt_spca_io::reader::ScDataReader;
@@ -44,6 +47,23 @@ struct Args {
     #[arg(long)]
     no_log: bool,
 
+    /// Bypass the `is_likely_log_normalized` auto-detect and use the raw matrix
+    /// as-is (no log-normalisation, no warning).  Implies `--no-log`.
+    #[arg(long)]
+    skip_preprocess: bool,
+
+    /// Transform label recorded in telemetry (free-form, e.g. "log1p", "raw").
+    #[arg(long, default_value = "auto")]
+    transform: String,
+
+    /// Replicate index recorded in telemetry.
+    #[arg(long, default_value_t = 0)]
+    rep: usize,
+
+    /// Append one JSON line of run telemetry to this path.
+    #[arg(long)]
+    telemetry_out: Option<String>,
+
     /// Project cells onto components and save a UMAP scatter-plot.
     #[arg(long)]
     umap: bool,
@@ -71,14 +91,22 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let force_log = !args.no_log;
+    let force_log = !args.no_log && !args.skip_preprocess;
+    let t_start = Instant::now();
+    let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    eprintln!("Using {num_cpus} CPU core(s) (std::thread::available_parallelism).");
 
     // -----------------------------------------------------------------------
-    // 1. Load + auto-normalise
+    // 1. Load (+ auto-normalise unless --skip-preprocess)
     // -----------------------------------------------------------------------
     eprintln!("Loading {} …", args.path);
     let gene_names = ScDataReader::load_var_names(&args.path)?;
-    let mut mat = load_and_prepare(&args.path, force_log)?;
+    let mut mat = if args.skip_preprocess {
+        eprintln!("--skip-preprocess: bypassing is_likely_log_normalized auto-detect.");
+        ScDataReader::load_h5ad_as_faer(&args.path)?
+    } else {
+        load_and_prepare(&args.path, force_log)?
+    };
 
     if let Some(n) = args.n_cells {
         let n = n.min(mat.nrows());
@@ -192,6 +220,30 @@ fn main() -> Result<()> {
             args.umap_n_neighbors,
             args.umap_min_dist,
         )?;
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Telemetry (--telemetry-out)
+    // -----------------------------------------------------------------------
+    if let Some(ref path) = args.telemetry_out {
+        let runtime_s = t_start.elapsed().as_secs_f64();
+        let record = serde_json::json!({
+            "transform": args.transform,
+            "N": n,
+            "rep": args.rep,
+            "lambda_plus": result.lambda_plus,
+            "sigma_sq": result.sigma_sq,
+            "ks_distance": result.ks_distance,
+            "sk_iters": result.sk_iters,
+            "sk_converged": result.sk_converged,
+            "sk_residual": result.sk_residual,
+            "s_eigenvalues": result.s_eigenvalues,
+            "runtime_s": runtime_s,
+            "num_cpus": num_cpus,
+        });
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(f, "{}", record)?;
+        eprintln!("Telemetry appended to {path}");
     }
 
     Ok(())
