@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use faer;
+use faer::{self, Col};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::Instant;
@@ -85,6 +85,25 @@ struct Args {
     /// UMAP min_dist (passed to umap-learn).
     #[arg(long, default_value_t = 0.1)]
     umap_min_dist: f32,
+
+    /// **P2.A** — load precomputed biwhitening factors from a JSON file
+    /// containing `{"c": [...], "d": [...]}` (lengths n and p respectively,
+    /// matching the input matrix after Stage 0 zero-row/col filtering).
+    /// When set, Sinkhorn-Knopp biwhitening is skipped and these factors are
+    /// applied directly. Enables fixed-biwhitening tests across N-subsamples
+    /// of the same population.
+    #[arg(long)]
+    bw_factors_in: Option<String>,
+
+    /// **P2.B** — write biwhitening factors, unrescaled eigenvalues, and
+    /// top-K eigenvectors of the σ̂²-rescaled covariance to this path as one
+    /// JSON object. Use the companion `--top-eigvec-count` to control K.
+    #[arg(long)]
+    bw_state_out: Option<String>,
+
+    /// **P2.B** — how many top eigenvectors to store/dump (default 20).
+    #[arg(long, default_value_t = 20)]
+    top_eigvec_count: usize,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -132,12 +151,37 @@ fn main() -> Result<()> {
     // 3. Sparse PCA
     // -----------------------------------------------------------------------
     eprintln!("Running Sparse PCA (λ = {}) …", args.lambda);
+
+    // P2.A: load precomputed biwhitening factors if provided.
+    let precomputed_factors = match args.bw_factors_in.as_deref() {
+        Some(path) => {
+            let txt = std::fs::read_to_string(path)
+                .with_context(|| format!("reading bw_factors_in from {path}"))?;
+            let v: serde_json::Value = serde_json::from_str(&txt)
+                .with_context(|| format!("parsing {path} as JSON"))?;
+            let c_arr = v.get("c").and_then(|x| x.as_array())
+                .with_context(|| format!("{path} missing 'c' array"))?;
+            let d_arr = v.get("d").and_then(|x| x.as_array())
+                .with_context(|| format!("{path} missing 'd' array"))?;
+            let c_vec: Vec<f64> = c_arr.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
+            let d_vec: Vec<f64> = d_arr.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect();
+            eprintln!("[P2.A] loaded precomputed biwhitening factors from {path} (|c|={}, |d|={})",
+                c_vec.len(), d_vec.len());
+            let c = Col::from_fn(c_vec.len(), |i| c_vec[i]);
+            let d = Col::from_fn(d_vec.len(), |j| d_vec[j]);
+            Some((c, d))
+        }
+        None => None,
+    };
+
     let config = FistaConfig {
         lambda: args.lambda,
         lambda_frac: args.lambda_frac,
         verbose: true,
         bw_max_iter: args.bw_max_iter,
         bw_damp: args.bw_damp,
+        precomputed_factors,
+        top_eigvec_count: args.top_eigvec_count,
         ..FistaConfig::default()
     };
     let result = SparsePCA::new(config).fit(&mat);
@@ -225,6 +269,23 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 8. Telemetry (--telemetry-out)
     // -----------------------------------------------------------------------
+    // P2.B: dump biwhitening state (factors, unrescaled eigenvalues, top eigenvectors)
+    if let Some(ref path) = args.bw_state_out {
+        let dump = serde_json::json!({
+            "bw_c": result.bw_c,
+            "bw_d": result.bw_d,
+            "s_eigenvalues_unrescaled": result.s_eigenvalues_unrescaled,
+            "top_eigenvectors": result.top_eigenvectors,
+            "sigma_sq": result.sigma_sq,
+            "q": result.q,
+            "lambda_plus": result.lambda_plus,
+            "n_cells": n,
+            "n_genes": p,
+        });
+        std::fs::write(path, serde_json::to_string(&dump)?)?;
+        eprintln!("[P2.B] biwhitening state dumped to {path}");
+    }
+
     if let Some(ref path) = args.telemetry_out {
         let runtime_s = t_start.elapsed().as_secs_f64();
         let record = serde_json::json!({
