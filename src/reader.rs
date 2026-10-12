@@ -3,7 +3,7 @@ use faer::Mat;
 use ndarray::{Array2, ArrayD, Ix2};
 
 use anndata::{ArrayElemOp, AnnDataOp, Backend};
-use anndata::data::{ArrayData, DynArray, DynCsrMatrix, DynCscMatrix};
+use anndata::data::{ArrayData, DynArray, DynCsrMatrix, DynCscMatrix, SelectInfoElem};
 use anndata_hdf5::H5;
 use nalgebra_sparse::CooMatrix;
 
@@ -53,6 +53,94 @@ impl ScDataReader {
             }
         }
     }
+}
+
+impl ScDataReader {
+    /// Read `X` as a CSR matrix without densifying (for `SparsePCA::fit_csr`).
+    /// Only CSR storage is accepted; values are cast to f64.
+    pub fn load_h5ad_as_csr(path: &str) -> Result<rmt_spca::sparse::CsrMatrix> {
+        let file = H5::open(path).with_context(|| format!("cannot open HDF5 file: {path}"))?;
+        let adata = anndata::AnnData::<H5>::open(file)
+            .context("file is not a valid AnnData (.h5ad)")?;
+        let data: ArrayData = adata
+            .get_x()
+            .get::<ArrayData>()
+            .context("failed to read X from file")?
+            .ok_or_else(|| anyhow::anyhow!("AnnData X slot is empty"))?;
+        array_to_csr(data)
+    }
+}
+
+/// Row-block reader over a CSR `X`, for streaming (`SparsePCA::fit_covariance`):
+/// only the requested rows are read from disk.
+pub struct CsrRowReader {
+    adata: anndata::AnnData<H5>,
+    pub n: usize,
+    pub p: usize,
+}
+
+impl CsrRowReader {
+    pub fn open(path: &str) -> Result<Self> {
+        let file = H5::open(path).with_context(|| format!("cannot open HDF5 file: {path}"))?;
+        let adata = anndata::AnnData::<H5>::open(file)
+            .context("file is not a valid AnnData (.h5ad)")?;
+        let (n, p) = (adata.n_obs(), adata.n_vars());
+        Ok(Self { adata, n, p })
+    }
+
+    /// Rows `a..b` as CSR.
+    pub fn range(&self, a: usize, b: usize) -> Result<rmt_spca::sparse::CsrMatrix> {
+        self.select(SelectInfoElem::from(a..b))
+    }
+
+    /// Arbitrary rows (in the given order) as CSR.
+    pub fn rows(&self, idx: &[usize]) -> Result<rmt_spca::sparse::CsrMatrix> {
+        self.select(SelectInfoElem::from(idx))
+    }
+
+    fn select(&self, sel: SelectInfoElem) -> Result<rmt_spca::sparse::CsrMatrix> {
+        let data: ArrayData = self
+            .adata
+            .get_x()
+            .slice_axis::<ArrayData, _>(0, sel)
+            .context("failed to read rows of X")?
+            .ok_or_else(|| anyhow::anyhow!("AnnData X slot is empty"))?;
+        array_to_csr(data)
+    }
+}
+
+/// CSR (canonical or not) `ArrayData` → `CsrMatrix`; other storage is rejected.
+fn array_to_csr(data: ArrayData) -> Result<rmt_spca::sparse::CsrMatrix> {
+    let dyn_csr = match data {
+        ArrayData::CsrMatrix(m) => m,
+        ArrayData::CsrNonCanonical(nc) => nc
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("failed to canonicalize CsrNonCanonical X"))?,
+        _ => anyhow::bail!("--sparse / --stream-block need X stored as CSR"),
+    };
+    macro_rules! to_csr {
+        ($m:expr, $cast:expr) => {{
+            let m = $m;
+            rmt_spca::sparse::CsrMatrix::new(
+                m.nrows(),
+                m.ncols(),
+                m.row_offsets().to_vec(),
+                m.col_indices().to_vec(),
+                m.values().iter().map(|&v| $cast(v)).collect(),
+            )
+        }};
+    }
+    let csr = match dyn_csr {
+        DynCsrMatrix::F32(m) => to_csr!(m, |v: f32| v as f64),
+        DynCsrMatrix::F64(m) => to_csr!(m, |v: f64| v),
+        DynCsrMatrix::I32(m) => to_csr!(m, |v: i32| v as f64),
+        DynCsrMatrix::I64(m) => to_csr!(m, |v: i64| v as f64),
+        DynCsrMatrix::U16(m) => to_csr!(m, |v: u16| v as f64),
+        DynCsrMatrix::U32(m) => to_csr!(m, |v: u32| v as f64),
+        DynCsrMatrix::U64(m) => to_csr!(m, |v: u64| v as f64),
+        _ => anyhow::bail!("unsupported CSR element type"),
+    };
+    csr.map_err(|e| anyhow::anyhow!("invalid CSR X: {e}"))
 }
 
 // ---------------------------------------------------------------------------

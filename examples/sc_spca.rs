@@ -6,9 +6,14 @@ use std::io::Write;
 use std::time::Instant;
 
 use rmt_spca_io::{load_and_prepare, project_cells, run_umap_and_plot, Preprocessor};
-use rmt_spca_io::reader::ScDataReader;
+use rmt_spca_io::reader::{CsrRowReader, ScDataReader};
+use rmt_spca::biwhitening::Biwhitener;
+use rmt_spca::sparse::CsrMatrix;
+use rmt_spca::streaming::{
+    cell_factors, gene_nnz, reset_rare_genes, subsample_spectrum, CovAccumulator, GeneMoments,
+};
 use rmt_spca::rmt::RmtTheory;
-use rmt_spca::spca::{FistaConfig, SparsePCA};
+use rmt_spca::spca::{EigensolverMode, FistaConfig, SparsePCA};
 use rmt_spca::markers::print_marker_table;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -104,6 +109,137 @@ struct Args {
     /// **P2.B** — how many top eigenvectors to store/dump (default 20).
     #[arg(long, default_value_t = 20)]
     top_eigvec_count: usize,
+
+    /// Write sparse loadings (p×k, row-major), biwhitening factors and
+    /// eigenvalues to this JSON path, for downstream clustering in Python.
+    #[arg(long)]
+    components_out: Option<String>,
+
+    /// Keep X sparse end to end (SparsePCA::fit_csr): memory O(nnz + p²)
+    /// instead of several dense n×p copies. Requires --skip-preprocess and CSR X;
+    /// not compatible with --umap or --n-cells.
+    #[arg(long)]
+    sparse: bool,
+
+    /// σ² and KS from the spectrum of N evenly spaced cells (m×m Gram) instead
+    /// of the full p×p EVD (EigensolverMode::Subsample). 0 = full EVD (default).
+    #[arg(long, default_value_t = 0)]
+    eig_subsample: usize,
+
+    /// Ceiling on the signal components searched for (FistaConfig::k_max).
+    #[arg(long, default_value_t = 20)]
+    k_max: usize,
+
+    /// One S-product per FISTA iteration instead of two (FistaConfig::fista_reuse_products).
+    #[arg(long)]
+    fista_reuse: bool,
+
+    /// Stream X from disk in blocks of this many cells (memory O(p² + block)):
+    /// gene factors from Sinkhorn on --bw-subsample cells, refined over all cells
+    /// --refine-passes times, then one pass accumulates the covariance.
+    /// Requires --skip-preprocess and CSR X without empty cells/genes. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    stream_block: usize,
+
+    /// Cells (evenly spaced) for the Sinkhorn warm start of --stream-block.
+    #[arg(long, default_value_t = 50_000)]
+    bw_subsample: usize,
+
+    /// Full-data gene-factor refinement passes for --stream-block. Rare genes
+    /// converge at ≈ √(n/(k·p)) per pass; 4 brings them within ~7%.
+    #[arg(long, default_value_t = 4)]
+    refine_passes: usize,
+
+    /// --stream-block: genes seen in fewer subsample cells than this get their
+    /// Sinkhorn factor reset before refinement (it can drift to ~1e11 and erase
+    /// the cells expressing them; see rmt_spca::streaming::reset_rare_genes).
+    #[arg(long, default_value_t = 5)]
+    min_gene_sub_cells: usize,
+}
+
+/// Evenly spaced indices t·n/m, t < m (stratified on files sorted by sample).
+fn spaced(n: usize, m: usize) -> Vec<usize> {
+    let m = m.clamp(1, n);
+    (0..m).map(|t| t * n / m).collect()
+}
+
+/// The streaming pipeline (see `rmt_spca::streaming`), reading row blocks from disk.
+fn fit_streaming(r: &CsrRowReader, args: &Args, config: FistaConfig) -> Result<rmt_spca::spca::SparsePCAResult> {
+    let (n, p, bs) = (r.n, r.p, args.stream_block);
+    let blocks = || (0..n).step_by(bs).map(move |a| (a, (a + bs).min(n)));
+    let no_empty_rows = |blk: &CsrMatrix, a: usize| -> Result<()> {
+        if let Some(i) = (0..blk.nrows()).find(|&i| blk.row(i).all(|(_, v)| v == 0.0)) {
+            anyhow::bail!("cell {} is empty: prefilter empty cells before --stream-block", a + i);
+        }
+        Ok(())
+    };
+
+    let t = Instant::now();
+    let sub = r.rows(&spaced(n, args.bw_subsample))?;
+    no_empty_rows(&sub, 0)?;
+    let (_, mut d, iters, ok, res) = Biwhitener {
+        max_iter: args.bw_max_iter,
+        damp: args.bw_damp,
+        ..Biwhitener::default()
+    }
+    .compute_csr(&sub);
+    eprintln!(
+        "[stream] Sinkhorn on {} cells: {iters} iters, converged={ok}, residual={res:.2e} ({:.1}s)",
+        sub.nrows(),
+        t.elapsed().as_secs_f64()
+    );
+    let reset = reset_rare_genes(&mut d, &gene_nnz(&sub), args.min_gene_sub_cells);
+    if reset > 0 && args.refine_passes == 0 {
+        anyhow::bail!("{reset} genes seen in < {} subsample cells need --refine-passes ≥ 1", args.min_gene_sub_cells);
+    }
+    eprintln!("[stream] reset {reset} rare-gene factors (< {} subsample cells)", args.min_gene_sub_cells);
+
+    for pass in 0..args.refine_passes {
+        let t = Instant::now();
+        let mut gm = GeneMoments::new(p);
+        for (a, b) in blocks() {
+            let blk = r.range(a, b)?;
+            no_empty_rows(&blk, a)?;
+            gm.add(&blk, &cell_factors(&blk, &d));
+        }
+        d = gm.finish();
+        eprintln!("[stream] refinement pass {} ({:.1}s)", pass + 1, t.elapsed().as_secs_f64());
+    }
+
+    let t = Instant::now();
+    let mut acc = CovAccumulator::new(p);
+    let mut c_all = Vec::with_capacity(n);
+    let mut gene_seen = vec![false; p];
+    for (a, b) in blocks() {
+        let blk = r.range(a, b)?;
+        no_empty_rows(&blk, a)?;
+        for i in 0..blk.nrows() {
+            for (j, _) in blk.row(i) {
+                gene_seen[j] = true;
+            }
+        }
+        let c = cell_factors(&blk, &d);
+        c_all.extend((0..c.nrows()).map(|i| c.read(i)));
+        acc.add(&blk, &c, &d);
+    }
+    if let Some(j) = gene_seen.iter().position(|&s| !s) {
+        anyhow::bail!("gene {j} is never expressed: prefilter empty genes before --stream-block");
+    }
+    let (s, mu) = acc.finish();
+    eprintln!("[stream] covariance pass ({:.1}s)", t.elapsed().as_secs_f64());
+
+    let spectrum = match config.eigensolver {
+        EigensolverMode::Subsample { n_cells } => {
+            let idx = spaced(n, n_cells);
+            let blk = r.rows(&idx)?;
+            let c_s = Col::from_fn(idx.len(), |t| c_all[idx[t]]);
+            let all: Vec<usize> = (0..idx.len()).collect();
+            Some(subsample_spectrum(&blk.centred_rows(&all, &c_s, &d, &mu)))
+        }
+        _ => None,
+    };
+    let c = Col::from_fn(n, |i| c_all[i]);
+    Ok(SparsePCA::new(config).fit_covariance(s, n, c, d, spectrum))
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -120,7 +256,22 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     eprintln!("Loading {} …", args.path);
     let gene_names = ScDataReader::load_var_names(&args.path)?;
-    let mut mat = if args.skip_preprocess {
+    let stream = args.stream_block > 0;
+    if (args.sparse || stream) && (!args.skip_preprocess || args.umap || args.n_cells.is_some()) {
+        anyhow::bail!("--sparse / --stream-block require --skip-preprocess and exclude --umap / --n-cells");
+    }
+    if stream && args.bw_factors_in.is_some() {
+        anyhow::bail!("--stream-block computes its own factors; drop --bw-factors-in");
+    }
+    let reader = if stream { Some(CsrRowReader::open(&args.path)?) } else { None };
+    let csr = if args.sparse && !stream {
+        Some(ScDataReader::load_h5ad_as_csr(&args.path)?)
+    } else {
+        None
+    };
+    let mut mat = if args.sparse || stream {
+        faer::Mat::zeros(0, 0)
+    } else if args.skip_preprocess {
         eprintln!("--skip-preprocess: bypassing is_likely_log_normalized auto-detect.");
         ScDataReader::load_h5ad_as_faer(&args.path)?
     } else {
@@ -133,9 +284,15 @@ fn main() -> Result<()> {
         eprintln!("Subsampling to {n} cells (of {}) …", mat.nrows());
         mat = faer::Mat::from_fn(n, p, |i, j| mat.read(i, j));
     }
-    let (n, p) = (mat.nrows(), mat.ncols());
+    let (n, p) = match (&reader, &csr) {
+        (Some(r), _) => (r.n, r.p),
+        (_, Some(x)) => (x.nrows(), x.ncols()),
+        _ => (mat.nrows(), mat.ncols()),
+    };
     println!("Loaded matrix: {n} cells × {p} genes");
-    println!("Log-normalised: {}", Preprocessor::is_likely_log_normalized(&mat));
+    if csr.is_none() && reader.is_none() {
+        println!("Log-normalised: {}", Preprocessor::is_likely_log_normalized(&mat));
+    }
 
     // -----------------------------------------------------------------------
     // 2. RMT threshold (pre-filter estimate)
@@ -182,9 +339,20 @@ fn main() -> Result<()> {
         bw_damp: args.bw_damp,
         precomputed_factors,
         top_eigvec_count: args.top_eigvec_count,
+        eigensolver: if args.eig_subsample > 0 {
+            EigensolverMode::Subsample { n_cells: args.eig_subsample }
+        } else {
+            EigensolverMode::Full
+        },
+        k_max: args.k_max,
+        fista_reuse_products: args.fista_reuse,
         ..FistaConfig::default()
     };
-    let result = SparsePCA::new(config).fit(&mat);
+    let result = match (&reader, &csr) {
+        (Some(r), _) => fit_streaming(r, &args, config)?,
+        (_, Some(x)) => SparsePCA::new(config).fit_csr(x),
+        _ => SparsePCA::new(config).fit(&mat),
+    };
     let (out_p, k) = (result.components.nrows(), result.components.ncols());
     println!("Components found: {k}  (each length {out_p})");
 
@@ -284,6 +452,26 @@ fn main() -> Result<()> {
         });
         std::fs::write(path, serde_json::to_string(&dump)?)?;
         eprintln!("[P2.B] biwhitening state dumped to {path}");
+    }
+
+    if let Some(ref path) = args.components_out {
+        let w = &result.components;
+        let rows: Vec<Vec<f64>> = (0..w.nrows())
+            .map(|i| (0..w.ncols()).map(|c| w.read(i, c)).collect())
+            .collect();
+        let dump = serde_json::json!({
+            "components": rows,
+            "eigenvalues": result.eigenvalues,
+            "bw_c": result.bw_c,
+            "bw_d": result.bw_d,
+            "sigma_sq": result.sigma_sq,
+            "lambda_plus": result.lambda_plus,
+            "ks_distance": result.ks_distance,
+            "collapsed_cells": result.collapsed_cells,
+            "max_gene_factor_ratio": result.max_gene_factor_ratio,
+        });
+        std::fs::write(path, serde_json::to_string(&dump)?)?;
+        eprintln!("components dumped to {path}");
     }
 
     if let Some(ref path) = args.telemetry_out {
