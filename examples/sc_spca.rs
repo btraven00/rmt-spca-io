@@ -32,9 +32,17 @@ struct Args {
     #[arg(long, default_value_t = 0.1)]
     lambda: f64,
 
-    /// Set λ = F × λ+, overriding --lambda.  ~0.3 targets 200–500 genes/component.
+    /// Set λ = F × λ+, overriding --lambda. Has no relation to the spectrum:
+    /// on A549 0.3 collapsed 50/53 components to single genes. Prefer --auto-penalty.
     #[arg(long)]
     lambda_frac: Option<f64>,
+
+    /// Choose λ by the paper's Eq. 8 (root-find λ* so that the sparse subspace
+    /// sits at the RMT-predicted distance from the outlier eigenspace), then
+    /// fit at SCALE × λ* (reference default 0.6). Overrides --lambda/--lambda-frac.
+    /// Costs ~10 FISTA runs.
+    #[arg(long, num_args = 0..=1, default_missing_value = "0.6", value_name = "SCALE")]
+    auto_penalty: Option<f64>,
 
     /// Max Sinkhorn-Knopp iterations for biwhitening.
     #[arg(long, default_value_t = 1000)]
@@ -307,7 +315,11 @@ fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // 3. Sparse PCA
     // -----------------------------------------------------------------------
-    eprintln!("Running Sparse PCA (λ = {}) …", args.lambda);
+    match (args.auto_penalty, args.lambda_frac) {
+        (Some(sc), _) => eprintln!("Running Sparse PCA (λ by Eq. 8, scale {sc}) …"),
+        (None, Some(f)) => eprintln!("Running Sparse PCA (λ = {f} × λ+) …"),
+        (None, None) => eprintln!("Running Sparse PCA (λ = {}) …", args.lambda),
+    }
 
     // P2.A: load precomputed biwhitening factors if provided.
     let precomputed_factors = match args.bw_factors_in.as_deref() {
@@ -334,6 +346,7 @@ fn main() -> Result<()> {
     let config = FistaConfig {
         lambda: args.lambda,
         lambda_frac: args.lambda_frac,
+        auto_penalty: args.auto_penalty,
         verbose: true,
         bw_max_iter: args.bw_max_iter,
         bw_damp: args.bw_damp,
@@ -371,6 +384,22 @@ fn main() -> Result<()> {
     println!("MP bulk edge λ+ = {lp:.4}  (q = {:.4}, post-filter)", result.q);
     println!("Noise scale σ²  = {:.4}  (should be ≈1 for well-biwhitened data)",
              result.sigma_sq);
+    println!(
+        "L1 penalty λ    = {:.4e}{}  subspace distance Σ(1−σ²) = {:.3} vs Eq. 8 target {:.3}",
+        result.lambda,
+        match result.lambda_star {
+            Some(st) => format!("  (Eq. 8 root λ* = {st:.4e})"),
+            None => String::new(),
+        },
+        result.subspace_distance,
+        result.target_distance
+    );
+    let singletons = (0..k)
+        .filter(|&j| (0..out_p).map(|i| result.components.read(i, j).abs()).fold(0.0, f64::max) > 0.9)
+        .count();
+    if singletons > 0 {
+        println!("⚠ {singletons}/{k} components are a single gene (max|w| > 0.9): over-penalised. Use --auto-penalty.");
+    }
 
     // -----------------------------------------------------------------------
     // 4. KS validation against MP bulk
@@ -466,6 +495,10 @@ fn main() -> Result<()> {
             "bw_d": result.bw_d,
             "sigma_sq": result.sigma_sq,
             "lambda_plus": result.lambda_plus,
+            "lambda": result.lambda,
+            "lambda_star": result.lambda_star,
+            "subspace_distance": result.subspace_distance,
+            "target_distance": result.target_distance,
             "ks_distance": result.ks_distance,
             "collapsed_cells": result.collapsed_cells,
             "max_gene_factor_ratio": result.max_gene_factor_ratio,
