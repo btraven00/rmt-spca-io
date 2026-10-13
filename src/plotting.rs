@@ -84,16 +84,16 @@ fn umap_via_python(
     // pyo3 panics (rather than returning Err) if the Python interpreter is
     // absent.  Catch that so the caller gets a clean error instead of a crash.
     std::panic::catch_unwind(|| {
-        Python::with_gil(|py| -> Result<Vec<f32>> {
-        let locals = PyDict::new_bound(py);
+        Python::attach(|py| -> Result<Vec<f32>> {
+        let locals = PyDict::new(py);
         locals.set_item("data_flat",   data_buf)?;
         locals.set_item("n_cells",     n)?;
         locals.set_item("n_comp",      k)?;
         locals.set_item("n_neighbors", n_neighbors)?;
         locals.set_item("min_dist",    min_dist as f64)?;
 
-        py.run_bound(
-            r#"
+        py.run(
+            cr#"
 import numpy as np
 import umap as _umap
 
